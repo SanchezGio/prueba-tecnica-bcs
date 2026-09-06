@@ -1,0 +1,28 @@
+# Terraform
+infra/.terraform/
+infra/*.tfstate
+infra/*.tfstate.backup
+infra/terraform.tfvars
+infra/.terraform.lock.hcl
+infra/crash.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Packer
+agent-image/packer/*.log
+packer_cache/
+
+# Reportes de escaneo generados localmente (se publican como artefactos del
+# pipeline, no se versionan en el repo)
+*-report.json
+trivy-*.json
+
+# Misceláneo
+.DS_Store
+*.env
+.env.*

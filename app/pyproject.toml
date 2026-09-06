@@ -1,0 +1,29 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "S"] # incluye flake8-bandit (S) para detección temprana en el editor
+
+[tool.ruff.lint.per-file-ignores]
+# S101 (uso de `assert`) es el patrón idiomático y esperado de pytest, no un
+# hallazgo de seguridad real — bandit ya excluye tests/ por completo (ver
+# abajo); ruff necesita su propia exclusión porque evalúa reglas "S" sobre
+# TODO el árbol, tests incluidos.
+"tests/*" = ["S101"]
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv"]
+
+[tool.pytest.ini_options]
+# El pipeline invoca `pytest app/tests` desde la raíz del repo (no desde
+# app/), y tests/test_main.py no tiene __init__.py — por defecto pytest solo
+# agrega el directorio del propio archivo de test a sys.path, nunca este
+# directorio (app/), que es donde vive el paquete real "app" (app/app/) que
+# el test necesita importar como `from app.main import app`. Esta opción
+# agrega explícitamente el directorio raíz de ESTE pyproject.toml (app/) a
+# sys.path antes de correr los tests, sin importar desde qué CWD se invoque
+# pytest — la causa de fondo (no solo el síntoma puntual del import), ya que
+# el mismo problema aparecería igual desde cualquier otro comando/CWD que no
+# sea exactamente `cd app && python -m pytest`.
+pythonpath = ["."]

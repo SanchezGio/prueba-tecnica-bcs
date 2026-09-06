@@ -1,0 +1,8 @@
+fastapi==0.141.1
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+# msgpack no es una dependencia directa nuestra — la resuelve pip
+# transitivamente a partir de las de arriba, y sin pin explícito el
+# resolver puede elegir una versión distinta en cada build. Se fija >=1.2.1
+# porque 1.1.2 (la última vez resuelta) trae GHSA-6v7p-g79w-8964 (HIGH).
+msgpack>=1.2.1

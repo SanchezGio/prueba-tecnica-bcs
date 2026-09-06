@@ -1,0 +1,71 @@
+trigger: none
+
+schedules:
+  - cron: "0 3 * * 1" # todos los lunes 03:00 UTC
+    displayName: "Rebuild semanal de la imagen del agente"
+    branches:
+      include:
+        - main
+    always: true
+
+pool:
+  vmImage: "ubuntu-latest"
+
+variables:
+  - group: cicd-ephemeral-agents-image # variables no secretas: resource group, gallery name, subnet id de build
+
+steps:
+  - task: AzureCLI@2
+    displayName: "Login vía Workload Identity Federation"
+    inputs:
+      azureSubscription: "svc-conn-azure-rm-oidc" # Service Connection tipo "Workload Identity federation"
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        az account show
+
+  - script: |
+      set -euxo pipefail
+      curl -sSL https://releases.hashicorp.com/packer/1.11.2/packer_1.11.2_linux_amd64.zip -o packer.zip
+      sudo unzip -o packer.zip -d /usr/local/bin
+      packer version
+      packer init agent-image/packer/agent.pkr.hcl
+    displayName: "Instalar e inicializar Packer"
+    timeoutInMinutes: 5
+
+  - task: AzureCLI@2
+    displayName: "Build + publish de la imagen (Packer)"
+    inputs:
+      azureSubscription: "svc-conn-azure-rm-oidc"
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        # El builder azure-arm de Packer pide la VNet/subred de build como
+        # nombres separados, no como un resource ID — se parsean acá para no
+        # tener que duplicar variables en el variable group de Azure DevOps.
+        BUILD_SUBNET_ID="$(BUILD_SUBNET_ID)"
+        VNET_RG=$(echo "$BUILD_SUBNET_ID" | cut -d'/' -f5)
+        VNET_NAME=$(echo "$BUILD_SUBNET_ID" | cut -d'/' -f9)
+        SUBNET_NAME=$(echo "$BUILD_SUBNET_ID" | rev | cut -d'/' -f1 | rev)
+
+        packer build \
+          -var "subscription_id=$(AZURE_SUBSCRIPTION_ID)" \
+          -var "resource_group_name=$(RESOURCE_GROUP_NAME)" \
+          -var "gallery_name=$(GALLERY_NAME)" \
+          -var "virtual_network_resource_group_name=${VNET_RG}" \
+          -var "virtual_network_name=${VNET_NAME}" \
+          -var "virtual_network_subnet_name=${SUBNET_NAME}" \
+          agent-image/packer/agent.pkr.hcl
+
+  - publish: trivy-agent-image-report.json
+    artifact: trivy-agent-image-report
+    displayName: "Publicar reporte de escaneo de la imagen (auditable)"
+
+  - task: PublishTestResults@2
+    displayName: "Gate: fallar si Trivy encontró CRITICAL sin mitigar"
+    condition: always()
+    inputs:
+      testResultsFormat: "JUnit"
+      testResultsFiles: "trivy-agent-image-report.json"
+      failTaskOnFailedTests: false # el gate real ocurre en agent.pkr.hcl (exit-code); aquí solo se deja evidencia

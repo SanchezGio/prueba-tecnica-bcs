@@ -1,0 +1,31 @@
+# Copiar a terraform.tfvars y completar antes de `terraform plan` / `apply`.
+# Este archivo de ejemplo NO contiene secretos — todas las credenciales de
+# ejecución se resuelven vía identidad administrada / OIDC (ver docs/architecture.md §5).
+
+# Opcional: si `terraform` no logra inferir la suscripción activa de tu
+# sesión de `az`, descomenta y completa esta línea (o exporta ARM_SUBSCRIPTION_ID).
+# subscription_id = "00000000-0000-0000-0000-000000000000"
+
+location     = "eastus"
+environment  = "dev"
+project_name = "cicd"
+
+azure_devops_organization_url = "https://dev.azure.com/tu-organizacion"
+azure_devops_project_name     = "tu-proyecto"
+
+# Ver variables.tf: ambos valores están acotados por un tope de cuota de
+# vCPUs total-regional (`az vm list-usage --location <region>`), no solo por
+# disponibilidad de SKU (`az vm list-skus`) — validar ambos antes de subir
+# estos números en una suscripción distinta.
+agent_vm_sku             = "Standard_D2s_v7"
+agent_pool_max_agents    = 1
+agent_pool_standby_count = 0
+
+# Déjalo en false en el primer `apply`; ponlo en true recién en el SEGUNDO
+# apply, después de publicar la primera versión de la imagen del agente
+# (ver docs/DEPLOYMENT_GUIDE.md, Fase 5).
+create_agent_pool = false
+
+# Opcional: por defecto usa una imagen pública de Microsoft solo para el
+# arranque inicial (ver variables.tf) — normalmente no hace falta tocar esto.
+# bootstrap_image = "mcr.microsoft.com/k8se/quickstart:latest"

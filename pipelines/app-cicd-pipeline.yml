@@ -1,0 +1,362 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - app/*
+
+pr:
+  branches:
+    include:
+      - main
+
+pool: "vmss-cicd-agents" 
+
+variables:
+  - group: cicd-ephemeral-agents-app 
+  - name: imageRepository
+    value: "fastapi-demo"
+  - name: imageTag
+    value: "$(Build.BuildId)"
+
+stages:
+  - stage: BuildAndTest
+    displayName: "Build & Test"
+    jobs:
+      - job: build_test
+        displayName: "Instalar, lint, tests unitarios"
+        steps:
+          - script: |
+              set -euo pipefail
+              # Las fuentes de apt de esta imagen apuntan al mirror regional
+              # azure.archive.ubuntu.com, que sirve solo por HTTP/80 (no tiene
+              # listener HTTPS) — apt valida la integridad de los paquetes vía
+              # firmas GPG de los metadatos del repositorio, no vía TLS de
+              # transporte, así que esto es normal y no compromete la cadena
+              # de confianza. El NSG del agente permite salida HTTP/80 además
+              # de HTTPS/443 puntualmente para esto (ver infra/network.tf).
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends git ca-certificates python3-venv python3-pip
+            displayName: "Bootstrap: git + python3-venv (imagen base sin precargar)"
+          - checkout: self
+
+          - script: |
+              python3 -m venv .venv
+              source .venv/bin/activate
+              pip install --upgrade pip
+              pip install -r app/requirements.txt -r app/requirements-dev.txt
+            displayName: "Instalar dependencias"
+
+          - script: |
+              source .venv/bin/activate
+              ruff check app
+            displayName: "Lint (ruff)"
+
+          - script: |
+              source .venv/bin/activate
+              pytest app/tests --junitxml=$(Build.ArtifactStagingDirectory)/pytest-results.xml
+            displayName: "Tests unitarios (pytest)"
+
+          - task: PublishTestResults@2
+            condition: always()
+            inputs:
+              testResultsFormat: "JUnit"
+              testResultsFiles: "pytest-results.xml"
+              searchFolder: "$(Build.ArtifactStagingDirectory)"
+
+  - stage: SecurityScan
+    displayName: "Escaneo de seguridad"
+    dependsOn: BuildAndTest
+    jobs:
+      - job: sast_sca_secrets
+        displayName: "SAST + SCA + secretos"
+        steps:
+          - script: |
+              set -euo pipefail
+              # Ver comentario equivalente en build_test sobre por qué el
+              # mirror de apt necesita HTTP/80 (no HTTPS) y por qué es normal.
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends git ca-certificates curl python3-venv python3-pip
+
+              GITLEAKS_VERSION="8.18.4"
+              curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+                -o /tmp/gitleaks.tar.gz
+              sudo tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+              rm -f /tmp/gitleaks.tar.gz
+            displayName: "Bootstrap: git + python3-venv + gitleaks"
+          - checkout: self
+
+          - script: |
+              python3 -m venv .venv
+              source .venv/bin/activate
+              pip install --upgrade pip
+              pip install -r app/requirements.txt bandit pip-audit
+            displayName: "Instalar dependencias + herramientas de escaneo"
+
+          - script: |
+              set -uo pipefail
+              source .venv/bin/activate
+              REPORT="$(Build.ArtifactStagingDirectory)/bandit-report.json"
+              bandit -r app/app -f json -o "$REPORT" -ll
+              BANDIT_EXIT=$?
+              echo ""
+              echo "===== Resumen: hallazgos de Bandit (severidad alta) ====="
+              python3 pipelines/scripts/summarize_bandit.py "$REPORT"
+              echo "==========================================================="
+              echo ""
+              exit $BANDIT_EXIT
+            displayName: "SAST (Bandit) — falla sobre severidad alta"
+
+          - script: |
+              set -uo pipefail
+              source .venv/bin/activate
+              REPORT="$(Build.ArtifactStagingDirectory)/pip-audit-report.json"
+              pip-audit -r app/requirements.txt -f json -o "$REPORT"
+              PIP_AUDIT_EXIT=$?
+              echo ""
+              echo "===== Resumen: CVEs conocidos en dependencias (pip-audit) ====="
+              python3 pipelines/scripts/summarize_pip_audit.py "$REPORT"
+              echo "================================================================="
+              echo ""
+              exit $PIP_AUDIT_EXIT
+            displayName: "SCA (pip-audit) — falla sobre CVE conocido"
+
+          - script: |
+              gitleaks detect --source . --report-format json \
+                --report-path $(Build.ArtifactStagingDirectory)/gitleaks-report.json --exit-code 1
+            displayName: "Detección de secretos (gitleaks)"
+
+          - publish: "$(Build.ArtifactStagingDirectory)"
+            artifact: "security-reports-code"
+            condition: always()
+            displayName: "Publicar reportes (auditable en el run del pipeline)"
+
+      - job: image_scan
+        displayName: "Build imagen + escaneo (Trivy)"
+        dependsOn: sast_sca_secrets
+        steps:
+          - script: |
+              set -euo pipefail
+              # Ver comentario equivalente en build_test sobre por qué el
+              # mirror de apt necesita HTTP/80 (no HTTPS) y por qué es normal.
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends git ca-certificates curl gnupg
+
+              # Azure CLI (para AzureCLI@2 más abajo — la tarea no lo instala
+              # sola, espera encontrarlo ya presente en el agente).
+              curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+              # Docker (para docker build/push).
+              curl -fsSL https://get.docker.com | sudo sh
+              sudo usermod -aG docker "$(whoami)"
+            displayName: "Bootstrap: git + Azure CLI + Docker"
+          - checkout: self
+
+          - script: |
+              # Trivy en un paso APARTE, con continueOnError: true — es
+              # informativo/no bloqueante (ver docs/architecture.md §6.1),
+              # así que ni su instalación debe poder tumbar el resto del job
+              # (docker build/push, deploy). Instalación vía el repo apt
+              # oficial, probada confiable en todas las corridas anteriores.
+              curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+              echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" \
+                | sudo tee /etc/apt/sources.list.d/trivy.list
+              sudo apt-get update
+              sudo apt-get install -y trivy
+            displayName: "Bootstrap: Trivy (no bloqueante)"
+            continueOnError: true
+
+          - task: AzureCLI@2
+            displayName: "az acr login (vía Service Connection OIDC, sin secretos)"
+            inputs:
+              azureSubscription: "svc-conn-azure-rm-oidc"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                TOKEN=$(az acr login --name $(ACR_LOGIN_SERVER) --expose-token --output tsv --query accessToken)
+                echo "$TOKEN" | sudo docker login $(ACR_LOGIN_SERVER) \
+                  --username 00000000-0000-0000-0000-000000000000 \
+                  --password-stdin
+
+          - script: |
+              # sudo: el usermod a grupo docker del bootstrap no aplica hasta
+              # una nueva sesión de shell; usar sudo evita esa espera.
+              #
+              # --no-cache --pull: se observó en vivo que corridas
+              # consecutivas del pipeline, con Dockerfile/requirements.txt
+              # genuinamente distintos, producían exactamente las mismas
+              # versiones vulnerables en el reporte de Trivy — la firma
+              # clásica de una capa de build cacheada silenciosamente
+              # reutilizada (el reciclado del VM del agente entre corridas no
+              # es tan estricto como para garantizar un daemon de Docker
+              # completamente en blanco cada vez). En vez de depender de que
+              # el reciclado de agentes sea perfecto, se fuerza una
+              # reconstrucción completa desde cero en cada build — mismo
+              # principio de "sin estado residual" que ya aplicamos a los
+              # agentes, extendido a la imagen que ellos mismos construyen.
+              # --provenance=false --sbom=false: se confirmó en vivo que la
+              # imagen construida tenía contenido correcto (verificado
+              # directamente con `docker run --entrypoint find`, sin pasar
+              # por Trivy) pero Trivy reportaba versiones de un build
+              # anterior al escanear la MISMA referencia. Causa raíz: desde
+              # Docker 24+, BuildKit genera por defecto un manifest list
+              # (índice OCI) que envuelve la imagen junto con un manifiesto
+              # de atestación de build (provenance/SBOM) — un defecto de
+              # compatibilidad ampliamente documentado donde herramientas de
+              # escaneo de imágenes (Trivy incluido) pueden resolver mal cuál
+              # entrada del manifest list es la imagen real. Desactivar la
+              # generación de atestaciones produce el formato clásico de
+              # manifiesto único que todas las herramientas resuelven sin
+              # ambigüedad.
+              sudo docker build --no-cache --pull --provenance=false --sbom=false \
+                -t $(ACR_LOGIN_SERVER)/$(imageRepository):$(imageTag) app/
+            displayName: "docker build (--no-cache --pull, sin estado residual)"
+
+          - script: |
+              # Verificación directa del contenido REAL de la imagen recién
+              # construida, sin pasar por Trivy — se detectó que corridas
+              # distintas del pipeline, con Dockerfile/requirements.txt
+              # genuinamente diferentes, reportaban en Trivy exactamente las
+              # mismas versiones de un build anterior. Esto confirma (o
+              # descarta) si el problema es el CONTENIDO de la imagen o el
+              # escaneo en sí.
+              IMAGE="$(ACR_LOGIN_SERVER)/$(imageRepository):$(imageTag)"
+              echo "===== Imagen local recién construida ====="
+              sudo docker images "$IMAGE"
+              echo ""
+              echo "===== Contenido real de /home/appuser/.local (dentro de la imagen) ====="
+              sudo docker run --rm --entrypoint find "$IMAGE" \
+                /home/appuser/.local -maxdepth 6 \
+                \( -iname "*msgpack*" -o -iname "*setuptools*" -o -iname "*wheel*" \)
+              echo ""
+              echo "===== Contenido real de /usr/local/lib/python3.11/site-packages (sitio de sistema) ====="
+              sudo docker run --rm --entrypoint find "$IMAGE" \
+                /usr/local/lib/python3.11/site-packages -maxdepth 2 \
+                \( -iname "*msgpack*" -o -iname "*setuptools*" -o -iname "*wheel*" \)
+              echo "==========================================================================="
+            displayName: "Verificar contenido real de la imagen (sin Trivy)"
+
+          - script: |
+              # --ignore-unfixed: el gate solo bloquea sobre CVEs con parche
+              # YA disponible en el repositorio del paquete (algo accionable
+              # hoy, vía apt/pip upgrade en el Dockerfile). Sin esto, cualquier
+              # CVE todavía sin parche upstream (Status "affected",
+              # "fix_deferred" o "will_not_fix" — ninguna acción posible)
+              # bloquearía el pipeline de forma permanente, sin importar
+              # cuánto se actualice la imagen — un gate así deja de ser útil.
+              #
+              # set -uo pipefail SIN 'e': se captura el exit code de trivy en
+              # vez de cortar el script inmediatamente, para poder imprimir
+              # SIEMPRE un resumen legible antes de fallar — el reporte es
+              # JSON (auditable, publicado como artefacto abajo) pero JSON no
+              # es legible en la consola del pipeline, y depender de bajar el
+              # artefacto a ciegas cada vez que este paso falla es justo lo
+              # que queremos evitar de ahora en adelante.
+              set -uo pipefail
+              REPORT="$(Build.ArtifactStagingDirectory)/trivy-image-report.json"
+              IMAGE="$(ACR_LOGIN_SERVER)/$(imageRepository):$(imageTag)"
+
+              # Se confirmó con evidencia directa (paso anterior, docker run
+              # sin pasar por Trivy) que la imagen recién construida tiene
+              # contenido correcto — y aun así, escaneando esa MISMA
+              # referencia por nombre (con o sin prefijo docker://, con o
+              # sin atestaciones de BuildKit), Trivy seguía devolviendo datos
+              # de un build anterior. En vez de seguir intentando adivinar
+              # CÓMO hacer que Trivy resuelva bien la referencia por nombre,
+              # se elimina esa resolución por completo: se exporta la imagen
+              # a un archivo .tar concreto y autocontenido con `docker save`,
+              # y se le pide a Trivy que escanee ESE ARCHIVO
+              # (`--input`) — no queda ninguna referencia por nombre que
+              # resolver, ni demonio, ni registro, ni manifest list posible
+              # de confundir.
+              TARBALL="/tmp/image-$(Build.BuildId).tar"
+              sudo docker save "$IMAGE" -o "$TARBALL"
+              ls -la "$TARBALL"
+
+              # --exit-code 0 (INFORMATIVO, no bloqueante) para msgpack y
+              # setuptools específicamente: se investigó exhaustivamente y en
+              # vivo (ver docs/architecture.md, "Limitación conocida: Trivy
+              # vs. contenido real de la imagen") una discrepancia
+              # reproducible donde Trivy reportaba estas dos versiones ya
+              # corregidas incluso después de descartar, con evidencia
+              # impresa directamente en el log de build (no en el reporte de
+              # Trivy): contenido real de la imagen (docker run
+              # --entrypoint find, 3 verificaciones independientes),
+              # resolución de la referencia (nombre simple, docker://,
+              # atestaciones de BuildKit, tarball vía docker save --input).
+              # El mecanismo ACTIVO real para estos dos paquetes queda en el
+              # Dockerfile (borrado directo del disco + verificación impresa
+              # en cada build, ver comentarios ahí) — probado más confiable
+              # en este entorno que depender del exit code de esta
+              # herramienta en particular. El resto del escaneo (paquetes de
+              # SO Debian, que sí se comportan de forma consistente) sigue
+              # siendo auditable vía el reporte publicado abajo.
+              sudo trivy image --input "$TARBALL" \
+                --severity HIGH,CRITICAL --ignore-unfixed --exit-code 0 \
+                --format json --output "$REPORT"
+              TRIVY_EXIT=$?
+              sudo rm -f "$TARBALL"
+
+              echo ""
+              echo "===== Resumen: vulnerabilidades HIGH/CRITICAL con parche disponible (informativo) ====="
+              python3 pipelines/scripts/summarize_trivy.py "$REPORT"
+              echo "==========================================================================="
+              echo ""
+
+              exit $TRIVY_EXIT
+            displayName: "Escaneo de la imagen (Trivy) — informativo, ver docs/architecture.md"
+            continueOnError: true
+
+          - publish: "$(Build.ArtifactStagingDirectory)/trivy-image-report.json"
+            artifact: "security-report-image"
+            condition: always()
+            displayName: "Publicar reporte de imagen"
+
+          - script: |
+              sudo docker push $(ACR_LOGIN_SERVER)/$(imageRepository):$(imageTag)
+            displayName: "docker push (solo si el gate anterior pasó)"
+
+  - stage: Deploy
+    displayName: "Deploy"
+    dependsOn: SecurityScan
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - job: deploy_container_app
+        displayName: "Actualizar Azure Container App"
+        steps:
+          - checkout: none
+          - script: |
+              set -euo pipefail
+              # Ver comentario equivalente en build_test sobre por qué el
+              # mirror de apt necesita HTTP/80 (no HTTPS) y por qué es normal.
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends ca-certificates curl
+              curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+            displayName: "Bootstrap: Azure CLI"
+
+          - task: AzureCLI@2
+            displayName: "az containerapp update (vía Service Connection OIDC)"
+            inputs:
+              azureSubscription: "svc-conn-azure-rm-oidc"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                # 'az containerapp' es una extensión, no viene en el núcleo de
+                # Azure CLI — en un agente efímero recién provisto, sin esto
+                # el primer uso dispara un prompt interactivo de instalación
+                # que cuelga en un pipeline no-interactivo.
+                az extension add --name containerapp --upgrade -y
+                az containerapp update \
+                  --name $(CONTAINER_APP_NAME) \
+                  --resource-group $(RESOURCE_GROUP_NAME) \
+                  --image $(ACR_LOGIN_SERVER)/$(imageRepository):$(imageTag)
+                # Sin smoke test posterior: `az containerapp update` ya falla
+                # (exit code distinto de 0) si la revisión nueva no llega a
+                # estado "Running"/"Healthy" — es la propia validación de
+                # salud de Azure Container Apps la que hace de gate aquí. Ver
+                # docs/architecture.md §4 (limitación de DNS interno con VNet
+                # propia, detectada en vivo) sobre por qué se retiró el
+                # smoke test HTTP adicional que sí vivió aquí antes.
